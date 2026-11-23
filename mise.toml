@@ -12,3 +12,7 @@ run = ["go vet ./...", "go test ./..."]
 [tasks.build]
 description = "Build ./bin/ups"
 run = "go build -o bin/ups ."
+
+[tasks.install]
+description = "Build and install ups to ~/.local/bin (on PATH)"
+run = "go build -o ~/.local/bin/ups ."

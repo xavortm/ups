@@ -44,6 +44,7 @@ JSON field names are stable; new fields may be added.
 mise run test     # go vet + go test
 mise run dev      # go run . (pass flags after --)
 mise run build    # -> bin/ups
+mise run install  # -> ~/.local/bin/ups (on PATH)
 ```
 
 macOS only for now. Missing tools (no Docker, no DDEV) are skipped, not errors.
