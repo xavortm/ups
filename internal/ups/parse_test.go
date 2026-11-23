@@ -2,7 +2,9 @@ package ups
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseLsofListen(t *testing.T) {
@@ -46,29 +48,43 @@ func TestUnder(t *testing.T) {
 	}
 }
 
-func TestDockerURLs(t *testing.T) {
-	got := dockerURLs("127.0.0.1:54329->5432/tcp, 127.0.0.1:8025-8026->8025-8026/tcp, " +
-		"0.0.0.0:8080->80/tcp, :::8080->80/tcp, 9000/tcp")
-	want := []string{
-		"postgres://localhost:54329", "localhost:8025", "localhost:8026", "http://localhost:8080",
+func TestDockerPorts(t *testing.T) {
+	got := dockerPorts("127.0.0.1:54329->5432/tcp, 127.0.0.1:8025-8026->8025-8026/tcp, " +
+		"0.0.0.0:8080->80/tcp, :::8080->80/tcp, 127.0.0.1:9001->9000/tcp, 9000/tcp")
+	want := []Port{
+		{54329, "postgres://localhost:54329", "db"},
+		{8025, "http://localhost:8025", "mail"},
+		{8026, "https://localhost:8026", "mail"},
+		{8080, "http://localhost:8080", "web"},
+		{9001, "localhost:9001", "other"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v\nwant %v", got, want)
+	}
+	if u := bestPortURL(got); u != "http://localhost:8080" {
+		t.Errorf("bestPortURL = %q", u)
 	}
 }
 
 func TestParseDockerPS(t *testing.T) {
 	out := []byte(`{"Names":"llmtodo-postgres-1","Ports":"127.0.0.1:54329->5432/tcp","Status":"Up 3 hours","Labels":"com.docker.compose.project=llmtodo,com.docker.compose.service=postgres,com.docker.compose.project.working_dir=/Users/a/code/llmtodo,desc=a, b"}
-{"Names":"ddev-x-web","Ports":"","Status":"Up","Labels":"com.ddev.platform=ddev"}
+{"Names":"ddev-x-db","Ports":"127.0.0.1:28832->3306/tcp","Status":"Up","Labels":"com.ddev.platform=ddev,com.ddev.site-name=x"}
+{"Names":"ddev-router","Ports":"127.0.0.1:80->80/tcp","Status":"Up","Labels":"com.ddev.platform=ddev"}
 `)
 	got := parseDockerPS(out)
-	if len(got) != 1 {
-		t.Fatalf("want 1 item (ddev skipped), got %+v", got)
+	if len(got) != 3 {
+		t.Fatalf("want 3 items, got %+v", got)
 	}
 	it := got[0]
 	if it.Name != "llmtodo" || it.Runs[0] != "docker postgres" || it.Path != "/Users/a/code/llmtodo" ||
-		!reflect.DeepEqual(it.URLs, []string{"postgres://localhost:54329"}) {
+		it.URL != "postgres://localhost:54329" {
 		t.Fatalf("got %+v", it)
+	}
+	if got[1].ddevSite != "x" || got[1].Internal {
+		t.Errorf("ddev site container = %+v", got[1])
+	}
+	if !got[2].Internal {
+		t.Errorf("ddev-router should be internal: %+v", got[2])
 	}
 	if l := parseLabels("desc=a, b,k=v"); l["desc"] != "a, b" || l["k"] != "v" {
 		t.Fatalf("labels = %v", l)
@@ -77,36 +93,50 @@ func TestParseDockerPS(t *testing.T) {
 
 func TestParseDDEV(t *testing.T) {
 	out := []byte(`{"level":"info","raw":[
-		{"name":"site","status":"running","approot":"/Users/a/code/site","httpsurl":"https://site.ddev.site","type":"wordpress"},
+		{"name":"site","status":"running","approot":"/Users/a/code/site","httpsurl":"https://site.ddev.site","primary_url":"https://site.ddev.site","mailpit_https_url":"https://site.ddev.site:8026","type":"wordpress"},
 		{"name":"old","status":"stopped","approot":"/Users/a/code/old","httpsurl":"https://old.ddev.site"}]}`)
 	got, err := parseDDEV(out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Name != "site" || got[0].URLs[0] != "https://site.ddev.site" {
+	if len(got) != 1 || got[0].Name != "site" || got[0].URL != "https://site.ddev.site" ||
+		!reflect.DeepEqual(got[0].Ports, []Port{{8026, "https://site.ddev.site:8026", "mail"}}) {
 		t.Fatalf("got %+v", got)
 	}
 }
 
 func TestGroupProcesses(t *testing.T) {
 	home := "/Users/a"
+	early, late := time.Unix(1000, 0), time.Unix(2000, 0)
 	got := groupProcesses([]proc{
-		{listener{7933, "node", []int{9229, 62264, 5173}}, home + "/code/bg/playground", "node",
-			"node /Users/a/code/bg/node_modules/.pnpm/vite@8.3.8_esbuild@0.28.2/node_modules/vite/bin/vite.js"},
-		{listener{7935, "workerd", []int{62265}}, home + "/code/bg/playground",
-			home + "/code/bg/node_modules/.bin/workerd", home + "/code/bg/node_modules/.bin/workerd serve"},
-		{listener{82512, "2.1.330", []int{55112}}, home + "/code/x", "claude", "claude"},
-		{listener{98830, "llmtodo", []int{7878}}, "/", home + "/Applications/llmtodo.app/Contents/MacOS/llmtodo", ""},
-		{listener{845, "rapportd", []int{49312}}, "/", "/usr/libexec/rapportd", "/usr/libexec/rapportd"},
+		{listener: listener{7933, "node", []int{9229, 62264, 5173}}, cwd: home + "/code/bg/playground", exe: "node",
+			args: "node /Users/a/code/bg/node_modules/.pnpm/vite@8.3.8_esbuild@0.28.2/node_modules/vite/bin/vite.js", started: &late},
+		{listener: listener{7935, "workerd", []int{62265}}, cwd: home + "/code/bg/playground",
+			exe: home + "/code/bg/node_modules/.bin/workerd", args: home + "/code/bg/node_modules/.bin/workerd serve", started: &early},
+		{listener: listener{82512, "2.1.330", []int{55112}}, cwd: home + "/code/x", exe: "claude", args: "claude"},
+		{listener: listener{98830, "llmtodo", []int{7878}}, cwd: "/", exe: home + "/Applications/llmtodo.app/Contents/MacOS/llmtodo"},
+		{listener: listener{845, "rapportd", []int{49312}}, cwd: "/", exe: "/usr/libexec/rapportd", args: "/usr/libexec/rapportd"},
+		{listener: listener{13244, "OrbStack Helper", []int{80}}, cwd: "/", exe: "/Applications/OrbStack.app/Contents/MacOS/OrbStack Helper"},
 	}, home)
 
-	if len(got) != 4 {
-		t.Fatalf("want 4 items (vite+workerd merged), got %d: %+v", len(got), got)
+	if len(got) != 5 {
+		t.Fatalf("want 5 items (vite+workerd merged), got %d: %+v", len(got), got)
 	}
 	pg := got[0]
-	if pg.Name != "playground" || pg.URLs[0] != "http://localhost:5173" || len(pg.URLs) != 4 ||
-		!reflect.DeepEqual(pg.Runs, []string{"vite", "workerd"}) || !reflect.DeepEqual(pg.PIDs, []int{7933, 7935}) {
+	if pg.Name != "playground" || pg.URL != "http://localhost:5173" || len(pg.Ports) != 4 ||
+		!reflect.DeepEqual(pg.Runs, []string{"vite", "workerd"}) || !reflect.DeepEqual(pg.PIDs, []int{7933, 7935}) ||
+		!strings.Contains(pg.Command, "vite.js") || pg.Started == nil || !pg.Started.Equal(early) {
 		t.Errorf("playground = %+v", pg)
+	}
+	roles := []string{}
+	for _, p := range pg.Ports {
+		roles = append(roles, p.Role)
+	}
+	if !reflect.DeepEqual(roles, []string{"web", "inspector", "ephemeral", "ephemeral"}) {
+		t.Errorf("roles = %v", roles)
+	}
+	if rt := got[4]; !rt.Internal || !rt.runtime {
+		t.Errorf("OrbStack should be an internal runtime: %+v", rt)
 	}
 	if got[1].Kind != "claude" || got[1].Name != "x" {
 		t.Errorf("claude = %+v", got[1])

@@ -10,15 +10,20 @@ import (
 	"strings"
 )
 
-// Schemes for well-known container ports, so a Postgres port isn't shown as http://.
-var schemes = map[int]string{
-	80: "http", 8080: "http", 3000: "http", 5173: "http", 8000: "http",
-	443: "https", 8443: "https",
-	5432: "postgres", 3306: "mysql", 6379: "redis", 27017: "mongodb",
+// Scheme and role for well-known container ports, so a Postgres port isn't
+// shown as http://.
+var containerPorts = map[int]struct{ scheme, role string }{
+	80: {"http", "web"}, 8080: {"http", "web"}, 3000: {"http", "web"},
+	5173: {"http", "web"}, 8000: {"http", "web"},
+	443: {"https", "web"}, 8443: {"https", "web"},
+	5432: {"postgres", "db"}, 3306: {"mysql", "db"}, 27017: {"mongodb", "db"},
+	6379: {"redis", "cache"},
+	8025: {"http", "mail"}, 8026: {"https", "mail"}, // Mailpit
 }
 
 type dockerPS struct {
 	Names  string
+	Image  string
 	Ports  string
 	Labels string
 	Status string
@@ -42,22 +47,30 @@ func parseDockerPS(out []byte) []Item {
 			continue
 		}
 		labels := parseLabels(c.Labels)
-		// DDEV containers are reported by the DDEV collector as one site.
-		if labels["com.ddev.platform"] == "ddev" {
-			continue
-		}
 		name, runs := c.Names, "docker"
 		if p, s := labels["com.docker.compose.project"], labels["com.docker.compose.service"]; p != "" && s != "" {
 			name, runs = p, "docker "+s
 		}
-		items = append(items, Item{
+		it := Item{
 			Name:   name,
 			Kind:   "docker",
 			Runs:   []string{runs},
-			URLs:   dockerURLs(c.Ports),
+			Ports:  dockerPorts(c.Ports),
+			Image:  c.Image,
 			Path:   labels["com.docker.compose.project.working_dir"],
 			Status: c.Status,
-		})
+		}
+		it.URL = bestPortURL(it.Ports)
+		// DDEV site containers get merged into the DDEV site (see mergeDDEV);
+		// the shared ones (router, ssh-agent) are infrastructure.
+		if labels["com.ddev.platform"] == "ddev" {
+			if site := labels["com.ddev.site-name"]; site != "" {
+				it.ddevSite = site
+			} else {
+				it.Internal = true
+			}
+		}
+		items = append(items, it)
 	}
 	return items
 }
@@ -77,10 +90,10 @@ func parseLabels(s string) map[string]string {
 	return m
 }
 
-// dockerURLs turns "127.0.0.1:8025-8026->8025-8026/tcp, :::5432->5432/tcp"
-// into one address per published host port. Unpublished ports are skipped.
-func dockerURLs(ports string) []string {
-	var urls []string
+// dockerPorts turns "127.0.0.1:8025-8026->8025-8026/tcp, :::5432->5432/tcp"
+// into one Port per published host port. Unpublished ports are skipped.
+func dockerPorts(ports string) []Port {
+	var out []Port
 	seen := map[int]bool{}
 	for _, mapping := range strings.Split(ports, ", ") {
 		host, container, ok := strings.Cut(mapping, "->")
@@ -97,14 +110,28 @@ func dockerURLs(ports string) []string {
 				continue
 			}
 			seen[p] = true
-			if scheme := schemes[cFrom+(p-hostFrom)]; scheme != "" {
-				urls = append(urls, fmt.Sprintf("%s://localhost:%d", scheme, p))
-			} else {
-				urls = append(urls, fmt.Sprintf("localhost:%d", p))
+			port := Port{Port: p, URL: fmt.Sprintf("localhost:%d", p), Role: "other"}
+			if known, ok := containerPorts[cFrom+(p-hostFrom)]; ok {
+				port.URL = fmt.Sprintf("%s://localhost:%d", known.scheme, p)
+				port.Role = known.role
 			}
+			out = append(out, port)
 		}
 	}
-	return urls
+	return out
+}
+
+// bestPortURL is the first web port's URL, else the first port's.
+func bestPortURL(ports []Port) string {
+	for _, p := range ports {
+		if p.Role == "web" {
+			return p.URL
+		}
+	}
+	if len(ports) > 0 {
+		return ports[0].URL
+	}
+	return ""
 }
 
 // portRange parses "8025" or "8025-8026".

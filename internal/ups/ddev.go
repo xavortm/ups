@@ -3,6 +3,8 @@ package ups
 import (
 	"context"
 	"encoding/json"
+	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -13,6 +15,8 @@ type ddevList struct {
 		AppRoot  string `json:"approot"`
 		HTTPSURL string `json:"httpsurl"`
 		HTTPURL  string `json:"httpurl"`
+		Primary  string `json:"primary_url"`
+		Mailpit  string `json:"mailpit_https_url"`
 		Type     string `json:"type"`
 	} `json:"raw"`
 }
@@ -36,18 +40,38 @@ func parseDDEV(out []byte) ([]Item, error) {
 		if p.Status != "running" {
 			continue
 		}
-		url := p.HTTPSURL
-		if url == "" {
-			url = p.HTTPURL
+		url := firstNonEmpty(p.Primary, p.HTTPSURL, p.HTTPURL)
+		var ports []Port
+		if port, ok := urlPort(p.Mailpit); ok {
+			ports = append(ports, Port{Port: port, URL: p.Mailpit, Role: "mail"})
 		}
 		items = append(items, Item{
 			Name:   p.Name,
 			Kind:   "ddev",
-			URLs:   []string{url},
+			URL:    url,
+			Ports:  ports, // the site's container ports (db, …) are added by mergeDDEV
 			Runs:   []string{strings.TrimSpace("ddev " + p.Type)},
 			Path:   p.AppRoot,
 			Status: p.Status,
 		})
 	}
 	return items, nil
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func urlPort(raw string) (int, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Port() == "" {
+		return 0, false
+	}
+	p, err := strconv.Atoi(u.Port())
+	return p, err == nil
 }

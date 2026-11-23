@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Name prefixes of processes that only proxy ports for containers
@@ -53,12 +54,7 @@ func collectProcesses(ctx context.Context, opt Options) ([]Item, error) {
 	if err != nil {
 		return nil, err
 	}
-	var ls []listener
-	for _, l := range parseLsofListen(out) {
-		if !isContainerRuntime(l.cmd) {
-			ls = append(ls, l)
-		}
-	}
+	ls := parseLsofListen(out)
 	if len(ls) == 0 {
 		return nil, nil
 	}
@@ -71,11 +67,17 @@ func collectProcesses(ctx context.Context, opt Options) ([]Item, error) {
 	cwdOut, _ := run(ctx, "lsof", "-a", "-d", "cwd", "-F", "pn", "-p", pidList)
 	commOut, _ := run(ctx, "ps", "-o", "pid=,comm=", "-p", pidList)
 	argsOut, _ := run(ctx, "ps", "-o", "pid=,args=", "-p", pidList)
+	startOut, _ := run(ctx, "ps", "-o", "pid=,lstart=", "-p", pidList)
 
 	procs := make([]proc, len(ls))
 	cwds, exes, args := parseLsofCwd(cwdOut), parsePs(commOut), parsePs(argsOut)
+	starts := parsePs(startOut)
 	for i, l := range ls {
 		procs[i] = proc{listener: l, cwd: cwds[l.pid], exe: exes[l.pid], args: args[l.pid]}
+		// lstart is local time, e.g. "Mon Nov 23 18:45:33 2026".
+		if t, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", starts[l.pid], time.Local); err == nil {
+			procs[i].started = &t
+		}
 	}
 	return groupProcesses(procs, opt.Home), nil
 }
@@ -83,20 +85,28 @@ func collectProcesses(ctx context.Context, opt Options) ([]Item, error) {
 type proc struct {
 	listener
 	cwd, exe, args string
+	started        *time.Time
 }
 
 // groupProcesses turns listeners into items, merging processes that share a
 // project folder (e.g. vite + its workerd child) into one item.
 func groupProcesses(procs []proc, home string) []Item {
+	type group struct {
+		item    Item
+		ports   []int
+		portPID map[int]int    // which process owns each port
+		args    map[int]string // pid -> command line
+	}
 	var (
-		items []Item
-		byKey = map[string]int{}
+		groups []*group
+		byKey  = map[string]*group{}
 	)
 	for _, p := range procs {
 		kind := "process"
 		if p.cmd == "claude" || filepath.Base(p.exe) == "claude" {
 			kind = "claude"
 		}
+		runtime := isContainerRuntime(p.cmd)
 		system := !under(p.cwd, home) && !under(p.exe, home)
 
 		name, path := p.cmd, p.cwd
@@ -110,44 +120,59 @@ func groupProcesses(procs []proc, home string) []Item {
 		}
 
 		key := kind + "\x00" + path
-		if system || path == "" || path == "/" {
+		if system || runtime || path == "" || path == "/" {
 			key = "pid\x00" + strconv.Itoa(p.pid) // never merge unrelated system processes
 		}
-		runs := detectTool(p.args, p.exe, p.cmd)
-
-		if i, ok := byKey[key]; ok {
-			it := &items[i]
-			it.PIDs = append(it.PIDs, p.pid)
-			it.ports = appendNew(it.ports, p.ports...)
-			if !contains(it.Runs, runs) {
-				it.Runs = append(it.Runs, runs)
+		g := byKey[key]
+		if g == nil {
+			g = &group{
+				item:    Item{Name: name, Kind: kind, Path: path, System: system, Internal: runtime, runtime: runtime},
+				portPID: map[int]int{},
+				args:    map[int]string{},
 			}
-			continue
+			byKey[key] = g
+			groups = append(groups, g)
 		}
-		byKey[key] = len(items)
-		items = append(items, Item{
-			Name:   name,
-			Kind:   kind,
-			Runs:   []string{runs},
-			PIDs:   []int{p.pid},
-			Path:   path,
-			System: system,
-			ports:  append([]int(nil), p.ports...),
-		})
+
+		it := &g.item
+		it.PIDs = append(it.PIDs, p.pid)
+		runs := detectTool(p.args, p.exe, p.cmd)
+		if runtime {
+			runs = "container runtime"
+		}
+		if !contains(it.Runs, runs) {
+			it.Runs = append(it.Runs, runs)
+		}
+		if p.started != nil && (it.Started == nil || p.started.Before(*it.Started)) {
+			it.Started = p.started
+		}
+		g.args[p.pid] = p.args
+		for _, port := range p.ports {
+			if _, ok := g.portPID[port]; !ok {
+				g.portPID[port] = p.pid
+				g.ports = append(g.ports, port)
+			}
+		}
 	}
 
-	for i := range items {
-		ports := items[i].ports
-		sort.SliceStable(ports, func(a, b int) bool {
-			ra, rb := portRank(ports[a]), portRank(ports[b])
+	items := make([]Item, len(groups))
+	for i, g := range groups {
+		sort.SliceStable(g.ports, func(a, b int) bool {
+			ra, rb := portRank(g.ports[a]), portRank(g.ports[b])
 			if ra != rb {
 				return ra < rb
 			}
-			return ports[a] < ports[b]
+			return g.ports[a] < g.ports[b]
 		})
-		for _, p := range ports {
-			items[i].URLs = append(items[i].URLs, fmt.Sprintf("http://localhost:%d", p))
+		it := g.item
+		for _, port := range g.ports {
+			it.Ports = append(it.Ports, Port{Port: port, URL: fmt.Sprintf("http://localhost:%d", port), Role: portRole(port)})
 		}
+		if len(g.ports) > 0 {
+			it.URL = it.Ports[0].URL
+			it.Command = g.args[g.portPID[g.ports[0]]] // the process serving URL
+		}
+		items[i] = it
 	}
 	return items
 }
@@ -167,6 +192,10 @@ func portRank(p int) int {
 		return 3
 	}
 	return 1
+}
+
+func portRole(p int) string {
+	return [...]string{"web", "other", "inspector", "ephemeral"}[portRank(p)]
 }
 
 // detectTool names what a process is running: a known dev tool from its
@@ -203,22 +232,6 @@ func contains(ss []string, s string) bool {
 		}
 	}
 	return false
-}
-
-func appendNew(dst []int, src ...int) []int {
-	for _, v := range src {
-		found := false
-		for _, d := range dst {
-			if d == v {
-				found = true
-				break
-			}
-		}
-		if !found {
-			dst = append(dst, v)
-		}
-	}
-	return dst
 }
 
 // parseLsofListen parses `lsof -F pcn` output: one "p<pid>" line per process,
